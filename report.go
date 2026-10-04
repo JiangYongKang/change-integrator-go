@@ -15,6 +15,9 @@ const (
 	StatusApplied    Status = "applied"
 	StatusSkipped    Status = "skipped"
 	StatusConflicted Status = "conflicted"
+	// StatusMismatch 表示接力变更的预期前置内容与实际应用后的内容对不上
+	// （区别于 StatusConflicted：后者是互不依赖的变更抢同一处）。
+	StatusMismatch Status = "mismatch"
 )
 
 // Conflict 描述一个冲突的具体位置与来源。

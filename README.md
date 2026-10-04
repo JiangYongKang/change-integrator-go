@@ -4,9 +4,10 @@
 **预演（rehearse）**与**实际应用（apply）**，给出可复现、可解释的结论，并支持中断续跑
 与重复提交识别。
 
-- 结论只可能是 `applied` / `skipped` / `conflicted`，且预演与应用对同一前置状态给出**完全一致**的结论。
+- 结论只可能是 `applied` / `skipped` / `conflicted` / `mismatch`，且预演与应用对同一前置状态给出**完全一致**的结论。
 - 顺序无法确定、缺少前置、目标重复时，变更集会被**整体拒绝**并返回可区分的拒绝原因，绝不静默丢弃或按到达顺序硬套。
 - 冲突时立即停止；已干净应用的变更**不回退、不重复应用**。
+- 同一条依赖链上的**接力式演进**（后一条在前一条落地结果上继续改同一处）依次成功应用，最终内容等于最后一步的结果。
 - 任何运行中断或同一变更集再次提交时，已成功应用的变更被识别并跳过，未完成部分从正确位置继续。
 
 ## 构建与验证
@@ -17,7 +18,7 @@
 go build ./...
 go vet ./...
 gofmt -l .      # 应无输出
-go test ./...   # 24 个测试 + 1 个 Example，覆盖冲突、重复提交、中断续跑
+go test ./...   # 34 个测试 + 1 个 Example，覆盖冲突、接力演进、重复提交、中断续跑
 go test ./... -v   # 查看单测日志：每条变更的标识、判定依据、冲突位置
 ```
 
@@ -87,7 +88,8 @@ r2, err := eng.Apply(changes)
 ## 冲突处理规则
 
 引擎严格按计划顺序处理，累加每个已应用变更在**基准**上的作用范围。应用下一个变更前，
-先将其范围与已占用范围比较：
+先将其范围与已占用范围比较（重叠对象若全部属于该变更的传递依赖闭包，则按
+**接力演进**处理，见下节）：
 
 - **同路径行区间相交**（`[a1,a2)` 与 `[b1,b2)` 满足 `a1 < b2 && b1 < a2`）→ 冲突；
   端点相接（如 `[1,3)` 与 `[3,5)`）**不冲突**。
@@ -106,6 +108,65 @@ r2, err := eng.Apply(changes)
 
 应用原语层面还有两类可区分失败：`ErrContextMismatch`（旧块在锚点与全文都找不到，
 或全文匹配到多处，引擎拒绝猜测位置）、创建已存在文件/修改不存在文件。
+
+## 接力式依赖改动（relay）
+
+CI 里常见一类提交：同一条依赖链上的变更**接力修改同一处内容**。例如某行先被
+`a` 从 `v0` 改成 `v1`，`b`（依赖 `a`）再把 `v1` 改成 `v2`，`c`（依赖 `b`）继续改成
+`v3`。这种情况下几条变更应依次成功应用，最终内容等于最后一步的结果，链路拉到
+几十条也稳定成立。
+
+### 适用范围与判定规则
+
+引擎按计划顺序累加已应用变更的基准作用范围；当前变更与已占范围重叠时，按
+重叠对象的来源分两类处理：
+
+- **重叠对象全部落在当前变更的传递依赖闭包内**（含已在此前运行中应用、本次未
+  提交的前置）→ 判定为**接力演进**，不做冲突。日志打印
+  `decision=relay basis=overlaps_only_own_dependencies`。
+- **存在任何一个不在依赖闭包内的重叠对象** → 仍是**冲突**（`conflicted`），
+  给出具体位置与来源。也就是说：互不依赖的变更改到同一处，结论与接力引入前
+  完全一致；接力豁免只覆盖“自己的前置”，**不会掩护与无关变更的重叠**。
+
+接力变更的应用走**严格模式**：
+
+1. hunk 必须在声明的锚点处精确匹配**预期前置内容**（即前序变更落地后的内容），
+   匹配成功才应用，日志打印 `basis=precondition_verified_at_anchor`；
+2. 锚点处内容对不上时，**绝不静默跳过、也绝不换到文件里别的位置套用**
+   （不做全文件搜索回退），而是给出可区分的失败结论 `mismatch`：
+   返回 `*RelayMismatchError`（`errors.Is(err, ErrRelayPrecondition)` 成立），
+   其中携带变更标识、路径、锚点行号、预期内容与实际内容；
+3. 接力创建文件时目标已存在、或接力修改时目标不存在，同样判为 `mismatch`。
+
+### 与无依赖重叠改动如何区分
+
+| 场景 | 结论 | 错误类型 |
+| --- | --- | --- |
+| 互不依赖的变更改到同一处 | `conflicted`，含位置与来源 | `*ConflictError` |
+| 依赖链上接力改同一处，前置内容对得上 | `applied`（严格模式） | — |
+| 声明了依赖，但预期前置内容与实际对不上 | `mismatch`，含预期/实际内容 | `*RelayMismatchError`（`ErrRelayPrecondition`） |
+
+`mismatch` 与 `conflicted` 一样会立即停止本次运行；之前已干净应用的变更保留
+不回退。预演与应用对接力场景（含失败路径）给出完全一致的结论；中断续跑时，
+已落地的接力前缀被识别并跳过，剩余部分从正确状态继续接力，只提交剩余变更
+（前置已在状态日志中）同样成立。
+
+### 本地验证
+
+```bash
+go test ./... -run 'TestRelay_' -v
+```
+
+日志中可看到每条变更的标识、拓扑位置、判定依据
+（`decision=relay` / `basis=precondition_verified_at_anchor` /
+`decision=mismatch path=... anchor=... expected=... actual=...`）。
+关键用例：`TestRelay_ChainAppliesInOrder`（同区域接力成功）、
+`TestRelay_LongChainStable`（40 节链路 + 反复提交稳定）、
+`TestRelay_PreconditionMismatch` / `TestRelay_NoRelocateToOtherPosition`
+（前置对不上且拒绝换位置）、`TestRelay_RehearseApplyIdentical`（两种模式一致）、
+`TestRelay_ResumeAfterInterruption` / `TestRelay_ResumeRemainingOnly`（中断续跑）、
+`TestRelay_IndependentOverlapStillConflict` /
+`TestRelay_RelayDoesNotShieldUnrelatedOverlap`（无依赖重叠仍判冲突）。
 
 ## 预演与应用模式
 
@@ -143,12 +204,13 @@ CI 进程被 kill）。
 
 - `Mode`：rehearse / apply；
 - `Order`：拓扑序变更 ID；
-- `Outcomes[]`：每条变更的 `ChangeID`、`Status`、`Reason`，冲突时附带 `Conflict`；
+- `Outcomes[]`：每条变更的 `ChangeID`、`Status`（applied/skipped/conflicted/mismatch）、
+  `Reason`，冲突时附带 `Conflict`；
 - `Completed`：变更集是否全部走到终态。
 
 传入 `Options.Logger` 后，每个决策都会打印结构化日志，包含**变更标识、依赖、
-拓扑位置、判定依据（applied/skipped/conflicted/interrupted）与冲突位置/来源**，
-便于 CI 页面解释结论。
+拓扑位置、判定依据（applied/skipped/conflicted/mismatch/relay/interrupted）与
+冲突位置/来源**，便于 CI 页面解释结论。
 
 ## 代码结构
 
@@ -156,8 +218,8 @@ CI 进程被 kill）。
 | --- | --- |
 | `model.go` | 原始输入、统一变更模型、归一化校验、作用范围、内容指纹 |
 | `plan.go` | 去重、依赖存在性、拓扑排序、四类拒绝原因 |
-| `workspace.go` | 工作区接口（磁盘/内存）、hunk 定位与应用原语 |
+| `workspace.go` | 工作区接口（磁盘/内存）、hunk 定位与应用原语（含接力严格模式） |
 | `journal.go` | 跨运行状态日志的原子持久化 |
-| `engine.go` | 两种模式的统一执行流程、冲突判定、跳过/续跑、覆盖层 |
+| `engine.go` | 两种模式的统一执行流程、冲突/接力判定、跳过/续跑、覆盖层 |
 | `report.go` | 模式、状态、冲突与报告的类型定义 |
-| `*_test.go` | 计划校验、冲突、模式一致性、中断续跑、工作区原语、端到端 Example |
+| `*_test.go` | 计划校验、冲突、接力演进、模式一致性、中断续跑、工作区原语、端到端 Example |

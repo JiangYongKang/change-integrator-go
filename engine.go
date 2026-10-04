@@ -39,6 +39,24 @@ func (e *ConflictError) Error() string {
 		c.ChangeID, c.AgainstID, c.Path, c.BaseStart, c.BaseEnd, c.Detail)
 }
 
+// RelayMismatchError 表示声明了依赖关系的接力变更，其预期前置内容
+// 与实际应用后的内容对不上（与 ConflictError 的“两方抢同一处”可区分）。
+type RelayMismatchError struct {
+	ChangeID string
+	Path     string
+	Anchor   int      // 预期位置的 1-based 锚点行号
+	Expected []string // 预期前置内容（该 hunk 的旧块）
+	Actual   []string // 实际该位置的内容
+}
+
+func (e *RelayMismatchError) Error() string {
+	return fmt.Sprintf("relay mismatch: change=%q at %s anchor line %d: expected %q, actual %q",
+		e.ChangeID, e.Path, e.Anchor, e.Expected, e.Actual)
+}
+
+// Unwrap 使 errors.Is(err, ErrRelayPrecondition) 成立。
+func (e *RelayMismatchError) Unwrap() error { return ErrRelayPrecondition }
+
 // NewEngine 创建引擎。
 func NewEngine(ws Workspace, journalPath string, opts Options) *Engine {
 	if opts.Logger == nil {
@@ -133,8 +151,12 @@ func (e *Engine) run(raw []RawChange, mode Mode) (*Report, error) {
 			continue
 		}
 
-		// 5.2 冲突判定：与所有更早的（含跳过的）已应用变更比较基准作用范围。
-		if c := firstConflict(ch, accum); c != nil {
+		// 5.2 冲突判定与接力识别：与所有更早的（含跳过的）已应用变更比较基准作用范围。
+		// 重叠对象若在当前变更的传递依赖闭包中，属于“接力式演进”，不判冲突，
+		// 改由应用原语严格校验前置内容；否则仍是“两方抢同一处”的冲突。
+		closure := depClosure(ch, plan.Changes)
+		c, relay := firstConflict(ch, accum, closure)
+		if c != nil {
 			report.Outcomes = append(report.Outcomes, Outcome{
 				ChangeID: id,
 				Status:   StatusConflicted,
@@ -145,6 +167,10 @@ func (e *Engine) run(raw []RawChange, mode Mode) (*Report, error) {
 			e.opts.Logger.Printf("change=%s deps=%v position=%d decision=conflicted against=%s path=%s base=[%d,%d)",
 				id, deps, pos, c.AgainstID, c.Path, c.BaseStart, c.BaseEnd)
 			return report, &ConflictError{Conflict: *c}
+		}
+		if relay {
+			e.opts.Logger.Printf("change=%s deps=%v position=%d decision=relay basis=overlaps_only_own_dependencies",
+				id, deps, pos)
 		}
 
 		// 5.3 中断注入点（应用前）。
@@ -157,7 +183,14 @@ func (e *Engine) run(raw []RawChange, mode Mode) (*Report, error) {
 		}
 
 		// 5.4 应用（预演落到覆盖层；应用落到真实工作区）。
-		if err := applyChange(ws, ch); err != nil {
+		// 接力变更走严格应用：锚点处必须精确匹配预期前置内容，不得换位置套用。
+		var aerr error
+		if relay {
+			aerr = applyChangeStrict(ws, ch)
+		} else {
+			aerr = applyChange(ws, ch)
+		}
+		if aerr != nil {
 			// 崩溃窗口安全网：若工作区内容已呈现该变更的结果，则视为已应用并补记日志。
 			if mode == ModeApply && detectAlreadyApplied(e.ws, ch) {
 				rec := AppliedRecord{ID: id, Fingerprint: ch.Fingerprint,
@@ -176,7 +209,20 @@ func (e *Engine) run(raw []RawChange, mode Mode) (*Report, error) {
 				}
 				continue
 			}
-			return report, fmt.Errorf("apply change %s: %w", id, err)
+			// 接力前置状态对不上：给出与冲突可区分的失败结论。
+			if relay && errors.Is(aerr, ErrRelayPrecondition) {
+				rm := relayMismatchDetails(ws, ch)
+				report.Outcomes = append(report.Outcomes, Outcome{
+					ChangeID: id,
+					Status:   StatusMismatch,
+					Reason: fmt.Sprintf("relay precondition mismatch at %s anchor line %d: expected %q, actual %q",
+						rm.Path, rm.Anchor, rm.Expected, rm.Actual),
+				})
+				e.opts.Logger.Printf("change=%s deps=%v position=%d decision=mismatch path=%s anchor=%d expected=%q actual=%q",
+					id, deps, pos, rm.Path, rm.Anchor, rm.Expected, rm.Actual)
+				return report, rm
+			}
+			return report, fmt.Errorf("apply change %s: %w", id, aerr)
 		}
 
 		// 5.5 记录结论。预演不持久化；应用在工作区写入成功后立即落状态日志。
@@ -196,7 +242,12 @@ func (e *Engine) run(raw []RawChange, mode Mode) (*Report, error) {
 		for _, sc := range ch.Scopes {
 			accum.add(id, sc)
 		}
-		e.opts.Logger.Printf("change=%s deps=%v position=%d decision=applied mode=%s", id, deps, pos, mode)
+		if relay {
+			e.opts.Logger.Printf("change=%s deps=%v position=%d decision=applied mode=%s relay=true basis=precondition_verified_at_anchor",
+				id, deps, pos, mode)
+		} else {
+			e.opts.Logger.Printf("change=%s deps=%v position=%d decision=applied mode=%s", id, deps, pos, mode)
+		}
 	}
 
 	report.Completed = len(report.Outcomes) == len(plan.Order)
@@ -220,22 +271,49 @@ func (a *scopeAccumulator) add(changeID string, sc Scope) {
 	a.entries = append(a.entries, scopeEntry{changeID: changeID, scope: sc})
 }
 
+// depClosure 返回 ch 的传递依赖闭包。不在本次变更集中、但已在此前运行中
+// 应用的前置（仅作为叶子 ID 出现）也计入闭包，以支持只提交剩余变更的续跑。
+func depClosure(ch *Change, changes map[string]*Change) map[string]bool {
+	closure := map[string]bool{}
+	stack := append([]string(nil), ch.DependsOn...)
+	for len(stack) > 0 {
+		d := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		if closure[d] {
+			continue
+		}
+		closure[d] = true
+		if dep, ok := changes[d]; ok {
+			stack = append(stack, dep.DependsOn...)
+		}
+	}
+	return closure
+}
+
 // firstConflict 返回 ch 与已占范围的首个冲突（按来源 ID 与位置确定，保证稳定）。
-func firstConflict(ch *Change, accum *scopeAccumulator) *Conflict {
+// 重叠对象若全部落在 closure（ch 的传递依赖闭包）中，则不视为冲突：
+// 返回 relay=true，表示这是接力式演进，由应用原语严格校验前置内容。
+func firstConflict(ch *Change, accum *scopeAccumulator, closure map[string]bool) (*Conflict, bool) {
 	type hit struct {
 		against string
 		sc      Scope
 	}
 	var hits []hit
+	relay := false
 	for _, mine := range ch.Scopes {
 		for _, e := range accum.entries {
-			if scopesOverlap(mine, e.scope) {
-				hits = append(hits, hit{against: e.changeID, sc: mine})
+			if !scopesOverlap(mine, e.scope) {
+				continue
 			}
+			if closure[e.changeID] {
+				relay = true
+				continue
+			}
+			hits = append(hits, hit{against: e.changeID, sc: mine})
 		}
 	}
 	if len(hits) == 0 {
-		return nil
+		return nil, relay
 	}
 	sort.SliceStable(hits, func(i, j int) bool {
 		if hits[i].against != hits[j].against {
@@ -258,7 +336,43 @@ func firstConflict(ch *Change, accum *scopeAccumulator) *Conflict {
 		BaseStart: h.sc.Start,
 		BaseEnd:   h.sc.End,
 		Detail:    detail,
+	}, relay
+}
+
+// relayMismatchDetails 在严格应用失败后定位第一个与预期前置内容不符的 hunk，
+// 构造包含具体位置、预期与实际内容的 RelayMismatchError。
+func relayMismatchDetails(ws Workspace, ch *Change) *RelayMismatchError {
+	for _, f := range ch.Files {
+		cur, exists, err := ws.Read(f.Path)
+		if f.Create {
+			if err == nil && exists {
+				return &RelayMismatchError{ChangeID: ch.ID, Path: f.Path, Anchor: 0,
+					Expected: nil, Actual: cur}
+			}
+			continue
+		}
+		if err != nil || !exists {
+			return &RelayMismatchError{ChangeID: ch.ID, Path: f.Path, Anchor: f.OldStart,
+				Expected: f.OldBlock, Actual: nil}
+		}
+		anchor := f.OldStart - 1
+		if anchor >= 0 && anchor+len(f.OldBlock) <= len(cur) &&
+			equalLines(cur[anchor:anchor+len(f.OldBlock)], f.OldBlock) {
+			continue
+		}
+		var actual []string
+		if anchor >= 0 && anchor < len(cur) {
+			end := anchor + len(f.OldBlock)
+			if end > len(cur) {
+				end = len(cur)
+			}
+			actual = append([]string(nil), cur[anchor:end]...)
+		}
+		return &RelayMismatchError{ChangeID: ch.ID, Path: f.Path, Anchor: f.OldStart,
+			Expected: f.OldBlock, Actual: actual}
 	}
+	// 严格应用已失败，理论上必有不符的 hunk；此处仅为兜底。
+	return &RelayMismatchError{ChangeID: ch.ID}
 }
 
 // scopesOverlap 判定两个基准作用范围是否冲突：

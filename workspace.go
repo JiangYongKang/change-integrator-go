@@ -17,6 +17,10 @@ type Workspace interface {
 // 上下文无法匹配（锚点行处既不是旧块，文件内也找不到唯一匹配位置）。
 var ErrContextMismatch = errors.New("context mismatch: old block not found at anchor or anywhere uniquely")
 
+// ErrRelayPrecondition 表示接力变更的预期前置内容（旧块）在锚点处与实际内容对不上。
+// 接力变更不允许换到别的位置套用，因此锚点不符即失败，不做全文件搜索。
+var ErrRelayPrecondition = errors.New("relay precondition mismatch: expected predecessor content not found at anchor")
+
 // DirWorkspace 是落盘工作区。
 type DirWorkspace struct {
 	root string
@@ -124,6 +128,17 @@ func joinLines(lines []string) string {
 // 每个 hunk 先在基准内容上定位（锚点优先，锚点不符再全文件唯一搜索），
 // 随后按位置从后往前替换，避免行号位移影响尚未处理的 hunk。
 func applyChange(ws Workspace, ch *Change) error {
+	return applyChangeMode(ws, ch, false)
+}
+
+// applyChangeStrict 是接力变更专用的应用原语：hunk 必须在声明的锚点处
+// 精确匹配预期前置内容，锚点不符即返回 ErrRelayPrecondition，
+// 不做全文件搜索——接力变更不得静默换到别的位置套用。
+func applyChangeStrict(ws Workspace, ch *Change) error {
+	return applyChangeMode(ws, ch, true)
+}
+
+func applyChangeMode(ws Workspace, ch *Change, strict bool) error {
 	byPath := map[string][]FileChange{}
 	var order []string
 	for _, f := range ch.Files {
@@ -140,6 +155,10 @@ func applyChange(ws Workspace, ch *Change) error {
 				return err
 			}
 			if exists {
+				if strict {
+					return fmt.Errorf("change %s file %s: %w: create expects absent file but it exists",
+						ch.ID, path, ErrRelayPrecondition)
+				}
 				return fmt.Errorf("create %s: target file already exists", path)
 			}
 			var out []string
@@ -156,11 +175,21 @@ func applyChange(ws Workspace, ch *Change) error {
 			return err
 		}
 		if !exists {
+			if strict {
+				return fmt.Errorf("change %s file %s: %w: modify expects existing file",
+					ch.ID, path, ErrRelayPrecondition)
+			}
 			return fmt.Errorf("modify %s: target file does not exist", path)
 		}
 		var ps []placedHunk
 		for _, h := range hunks {
-			start, perr := locateHunk(base, h)
+			var start int
+			var perr error
+			if strict {
+				start, perr = locateHunkStrict(base, h)
+			} else {
+				start, perr = locateHunk(base, h)
+			}
 			if perr != nil {
 				return fmt.Errorf("change %s file %s: %w", ch.ID, path, perr)
 			}
@@ -206,6 +235,17 @@ func locateHunk(base []string, h FileChange) (int, error) {
 		return 0, ErrContextMismatch
 	}
 	return 0, fmt.Errorf("%w: old block matches %d locations", ErrContextMismatch, len(found))
+}
+
+// locateHunkStrict 是接力变更的定位：只允许锚点处精确匹配，
+// 不匹配即返回 ErrRelayPrecondition，绝不退化为全文件搜索（拒绝换位置套用）。
+func locateHunkStrict(base []string, h FileChange) (int, error) {
+	anchor := h.OldStart - 1
+	if anchor >= 0 && anchor+len(h.OldBlock) <= len(base) &&
+		equalLines(base[anchor:anchor+len(h.OldBlock)], h.OldBlock) {
+		return anchor, nil
+	}
+	return 0, fmt.Errorf("%w: anchor line %d", ErrRelayPrecondition, h.OldStart)
 }
 
 func equalLines(a, b []string) bool {
