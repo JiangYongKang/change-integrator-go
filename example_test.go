@@ -63,11 +63,11 @@ func Example() {
 	}
 
 	// Output:
-	// change=a deps=[] position=0 decision=applied mode=rehearse
-	// change=b deps=[a] position=1 decision=applied mode=rehearse
+	// change=a deps=[] position=0 decision=applied mode=rehearse relay=false
+	// change=b deps=[a] position=1 decision=applied mode=rehearse relay=false
 	// rehearse order: [a b]
-	// change=a deps=[] position=0 decision=applied mode=apply
-	// change=b deps=[a] position=1 decision=applied mode=apply
+	// change=a deps=[] position=0 decision=applied mode=apply relay=false
+	// change=b deps=[a] position=1 decision=applied mode=apply relay=false
 	// applied: [line1-a line2 line3-b]
 	// change=a deps=[] position=0 decision=skipped basis=journal_record order=0
 	// change=b deps=[a] position=1 decision=skipped basis=journal_record order=1

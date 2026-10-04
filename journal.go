@@ -17,6 +17,9 @@ type AppliedRecord struct {
 	Order       int       `json:"order"`
 	AppliedAt   time.Time `json:"applied_at"`
 	Scopes      []Scope   `json:"scopes"`
+	// DependsOn 记录该变更声明的前置，使跨运行的接力祖先链在中断续跑、
+	// 只提交剩余变更时仍可被识别（旧版日志无此字段时按无已知前置处理）。
+	DependsOn []string `json:"depends_on,omitempty"`
 }
 
 // journalFile 是状态日志的 JSON 存储结构。

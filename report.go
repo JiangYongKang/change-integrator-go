@@ -15,6 +15,9 @@ const (
 	StatusApplied    Status = "applied"
 	StatusSkipped    Status = "skipped"
 	StatusConflicted Status = "conflicted"
+	// StatusStale 接力式变更声明了依赖，但其预期前置内容与前序变更
+	// 实际落地后的内容对不上（前置状态不匹配），与“两方抢同一处”的冲突可区分。
+	StatusStale Status = "stale"
 )
 
 // Conflict 描述一个冲突的具体位置与来源。
